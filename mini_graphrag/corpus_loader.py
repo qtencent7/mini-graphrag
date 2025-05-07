@@ -38,16 +38,18 @@ class CorpusLoader:
         try:
             # 尝试导入PyPDF2库
             try:
-                import pdfplumber
+                import PyPDF2
             except ImportError:
                 print("未安装PyPDF2库。请使用命令安装: pip install pdfplumber")
                 return ""
             
             # 打开PDF文件
-            with pdfplumber.open(self.path, 'rb') as file:
-                
+            with open(self.path, 'rb') as file:
+                # 创建PDF阅读器对象
+                pdf_reader = PyPDF2.PdfReader(file)
+
                 # 获取PDF页数
-                num_pages = len(file.pages)
+                num_pages = len(pdf_reader.pages)
                 print(f"PDF文件总页数: {num_pages}")
                 # 确定要读取的页数（从第20页开始，最多读10页）
                 start_page = 19  # 索引从0开始，所以第20页是索引19
@@ -61,7 +63,7 @@ class CorpusLoader:
                 # 提取文本
                 text = ""
                 for page_num in range(start_page, start_page + pages_to_read):
-                    page = file.pages[page_num]
+                    page = pdf_reader.pages[page_num]
                     text += page.extract_text() + "\n\n"
                 
                 print(f"已成功读取PDF文件的前{pages_to_read}页")

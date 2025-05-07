@@ -67,6 +67,213 @@ class GraphRAG:
             print(f"警告: 语料库文件 {corpus_file_path} 未找到。self.corpus 将保持为空列表。")
             self.corpus = [] # 如果文件不存在，则设置为空列表
         
+
+    def query(self, query: str):
+        # 1. 从neo4j图数据中找到相关的内容
+        relevant_content = self._find_relevant_content(query)
+
+        # 2. 调用大语言模型进行查询
+        answer = self._query_with_llm(query, relevant_content)
+
+        return answer
+
+    def _find_relevant_content(self, query: str):
+        """
+        从Neo4j图数据库中查找与查询相关的内容
+        
+        参数:
+        - query: 用户查询字符串
+        
+        返回:
+        - str: 与查询相关的内容文本
+        """
+        try:
+            # 从环境变量或配置中获取Neo4j连接信息
+            uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+            user = os.getenv("NEO4J_USER", "neo4j")
+            password = os.getenv("NEO4J_PASSWORD", "password")
+            
+            # 创建Neo4j驱动
+            from neo4j import GraphDatabase
+            driver = GraphDatabase.driver(uri, auth=(user, password))
+            
+            # 使用会话执行查询
+            with driver.session() as session:
+                # 1. 首先，从查询中提取关键实体
+                entities = self._extract_entities_from_query(query)
+                
+                if not entities:
+                    print("未能从查询中提取实体，将使用通用查询")
+                    # 如果无法提取实体，使用通用查询
+                    result = session.run('''
+                        MATCH (source:Entity)-[r:RELATES]->(target:Entity)
+                        RETURN source.name AS source, r.type AS relation, target.name AS target
+                        LIMIT 10
+                    ''')
+                else:
+                    # 如果提取到实体，使用实体进行查询
+                    print(f"从查询中提取到实体: {entities}")
+                    # 构建查询参数
+                    params = {'entities': entities}
+                    
+                    # 使用UNWIND处理实体列表，查找与这些实体相关的关系
+                    result = session.run('''
+                        UNWIND $entities AS entity
+                        MATCH (n:Entity)
+                        WHERE n.name CONTAINS entity OR entity CONTAINS n.name
+                        MATCH (n)-[r:RELATES]-(m:Entity)
+                        RETURN n.name AS source, r.type AS relation, m.name AS target, r.source_doc AS doc_id
+                    ''', params)
+                
+                # 收集查询结果
+                relations = []
+                doc_ids = set()
+                for record in result:
+                    relations.append({
+                        'source': record['source'],
+                        'relation': record['relation'],
+                        'target': record['target']
+                    })
+                    if 'doc_id' in record and record['doc_id']:
+                        doc_ids.add(record['doc_id'])
+                
+                # 关闭驱动
+                driver.close()
+                
+                # 2. 如果找到了关系，获取相关文档内容
+                if relations:
+                    print(f"找到 {len(relations)} 个相关关系")
+                    
+                    # 如果有文档ID，从语料库中获取相应内容
+                    relevant_content = ""
+                    if doc_ids:
+                        for doc_id in doc_ids:
+                            content = self._get_content_by_id(doc_id)
+                            if content:
+                                relevant_content += content + "\n\n"
+                    
+                    # 如果没有找到相关内容，至少返回找到的关系
+                    if not relevant_content:
+                        relevant_content = "根据查询，找到以下相关信息：\n"
+                        for rel in relations:
+                            relevant_content += f"- {rel['source']} {rel['relation']} {rel['target']}\n"
+                    
+                    return relevant_content
+                else:
+                    print("未找到与查询相关的关系")
+                    return "未找到与查询相关的信息。"
+                
+        except Exception as e:
+            print(f"查询Neo4j时发生错误: {e}")
+            return "查询图数据库时发生错误，无法获取相关内容。"
+    
+    def _extract_entities_from_query(self, query: str) -> list:
+        """
+        从查询中提取可能的实体
+        
+        参数:
+        - query: 用户查询字符串
+        
+        返回:
+        - list: 可能的实体列表
+        """
+        try:
+            # 使用大语言模型提取查询中的实体
+            prompt = f"""
+            请从以下查询中提取可能的实体名称（人物、地点、组织、概念等）。
+            只返回实体列表，格式为JSON数组，例如 ["实体1", "实体2"]。
+            如果没有找到实体，请返回空数组 []。
+            
+            查询: {query}
+            """
+            
+            response = self.llm_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "你是一个专业的实体提取助手。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+            
+            result_text = response.choices[0].message.content
+            
+            # 尝试从响应中提取JSON部分
+            import re
+            json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+            if json_match:
+                entities = json.loads(json_match.group())
+            else:
+                # 如果没有找到JSON数组格式，尝试直接解析整个响应
+                entities = json.loads(result_text)
+            
+            # 确保返回的是列表
+            if not isinstance(entities, list):
+                print(f"警告: 模型返回的不是列表格式: {entities}")
+                return []
+            
+            return entities
+            
+        except Exception as e:
+            print(f"从查询中提取实体时发生错误: {e}")
+            return []
+    
+    def _get_content_by_id(self, content_id: str) -> str:
+        """
+        根据内容ID从语料库中获取内容
+        
+        参数:
+        - content_id: 内容的唯一标识符
+        
+        返回:
+        - str: 对应的内容，如果未找到则返回空字符串
+        """
+        if not isinstance(self.corpus, list):
+            return ""
+        
+        for item in self.corpus:
+            if isinstance(item, dict) and item.get("contentKey") == content_id:
+                return item.get("content", "")
+        
+        return ""
+
+        
+        
+    def _query_with_llm(self, query: str, relevant_content: str):
+        try:
+            # 构建提示词，要求模型回答问题
+            prompt = f"""
+            请根据以下已知信息回答问题。
+            如果无法从已知信息中得到答案，请回答 "我不知道"。
+
+            已知信息：
+            {relevant_content}
+
+            问题：
+            {query}
+
+            回答：
+            """
+
+            # 调用大语言模型
+            response = self.llm_client.chat.completions.create(
+                model="deepseek-chat", # 根据实际使用的模型调整
+                messages=[
+                    {"role": "system", "content": "你是一个专业的问答助手。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1, # 低温度以获得更确定性的结果
+                max_tokens=2000 # 根据需要调整  
+            )
+            # 解析响应
+            answer = response.choices[0].message.content
+            return answer
+
+        except Exception as e:
+            print(f"查询时发生错误: {e}")
+            return None
+
     """
         保存语料库到文件
     """
